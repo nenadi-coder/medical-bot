@@ -1,4 +1,4 @@
-const { Telegraf, Markup } = require("telegraf");
+const { Telegraf } = require("telegraf");
 const mysql = require("mysql2/promise");
 
 // ================= ENV =================
@@ -18,22 +18,20 @@ const db = mysql.createPool({
   connectionLimit: 10,
 });
 
-// ================= BOT STATE =================
-const state = {}; 
-// structure:
-// state[userId] = "WAITING_EMAIL"
+// ================= STATE =================
+const userState = {};
 
 // ================= BOT =================
 const bot = new Telegraf(BOT_TOKEN);
 
 // ================= START =================
 bot.start(async (ctx) => {
-  const id = ctx.from.id;
+  const telegramId = ctx.from.id;
 
-  state[id] = "WAITING_EMAIL";
+  userState[telegramId] = "WAITING_EMAIL";
 
-  await ctx.reply(
-    "👋 Welcome to Medical Bot\n\n📩 Please send your email to link your account:"
+  return ctx.reply(
+    "👋 Welcome\n\n📩 Please send your email to continue:"
   );
 });
 
@@ -43,17 +41,19 @@ bot.on("text", async (ctx) => {
   const text = ctx.message.text.trim();
 
   try {
-    // ================= 1. EMAIL LINKING =================
-    if (state[telegramId] === "WAITING_EMAIL") {
-      const email = text.toLowerCase().replace(/\s+/g, "");
+    const state = userState[telegramId];
+
+    // ================= STEP 1: EMAIL LINKING =================
+    if (state === "WAITING_EMAIL") {
+      const email = text.toLowerCase();
 
       const [rows] = await db.query(
         "SELECT * FROM patients WHERE LOWER(email) = ?",
         [email]
       );
 
-      if (!rows.length) {
-        return ctx.reply("❌ Email not found. Please register on the website first.");
+      if (rows.length === 0) {
+        return ctx.reply("❌ Email not found. Try again:");
       }
 
       const patient = rows[0];
@@ -63,106 +63,57 @@ bot.on("text", async (ctx) => {
         [telegramId, patient.patient_id]
       );
 
-      state[telegramId] = "MENU";
+      userState[telegramId] = "LINKED";
 
       return ctx.reply(
-        `✅ Welcome ${patient.first_name}`,
-        Markup.keyboard([
-          ["📅 My Appointments"],
-          ["❌ Cancel Appointment", "🔁 Reschedule Appointment"],
-        ]).resize()
+        `✅ Welcome ${patient.first_name}\n\nType: My Appointments`
       );
     }
 
-    // ================= 2. GET LINKED PATIENT =================
-    const [pRows] = await db.query(
+    // ================= STEP 2: CHECK LINK =================
+    const [patientRows] = await db.query(
       "SELECT * FROM patients WHERE telegram_user_id = ?",
       [telegramId]
     );
 
-    if (!pRows.length) {
-      state[telegramId] = "WAITING_EMAIL";
+    if (patientRows.length === 0) {
+      userState[telegramId] = "WAITING_EMAIL";
       return ctx.reply("⚠️ Account not linked. Please send your email:");
     }
 
-    const patient = pRows[0];
+    const patient = patientRows[0];
 
-    // ================= 3. MY APPOINTMENTS =================
-    if (text === "📅 My Appointments") {
+    // ================= STEP 3: MENU =================
+    if (text === "My Appointments") {
       const [apps] = await db.query(
         "SELECT * FROM appointments WHERE patient_id = ? ORDER BY appointment_date DESC",
         [patient.patient_id]
       );
 
-      if (!apps.length) {
+      if (apps.length === 0) {
         return ctx.reply("📭 No appointments found.");
       }
 
       const message = apps
         .map(
           (a) =>
-            `🆔 ID: ${a.appointment_id}\n📅 ${a.appointment_date} ${a.appointment_time}\n📌 Status: ${a.status}`
+            `🆔 ${a.appointment_id}\n📅 ${a.appointment_date} ${a.appointment_time}\n📌 ${a.status}`
         )
         .join("\n\n");
 
       return ctx.reply(message);
     }
 
-    // ================= 4. CANCEL =================
-    if (text === "❌ Cancel Appointment") {
-      return ctx.reply("Send:\n❌ Cancel <appointment_id>");
-    }
-
-    if (text.startsWith("Cancel")) {
-      const parts = text.split(" ");
-      const appointmentId = parts[1];
-
-      if (!appointmentId) {
-        return ctx.reply("❌ Invalid format. Example: Cancel 5");
-      }
-
-      await db.query(
-        "UPDATE appointments SET status = 'cancelled' WHERE appointment_id = ? AND patient_id = ?",
-        [appointmentId, patient.patient_id]
-      );
-
-      return ctx.reply("❌ Appointment cancelled successfully.");
-    }
-
-    // ================= 5. RESCHEDULE =================
-    if (text === "🔁 Reschedule Appointment") {
-      return ctx.reply(
-        "Send:\n🔁 Reschedule <id> <YYYY-MM-DD> <HH:MM>\n\nExample:\nReschedule 3 2026-05-10 14:00"
-      );
-    }
-
-    if (text.startsWith("Reschedule")) {
-      const parts = text.split(" ");
-
-      const appointmentId = parts[1];
-      const newDate = parts[2];
-      const newTime = parts[3];
-
-      if (!appointmentId || !newDate || !newTime) {
-        return ctx.reply("❌ Invalid format.\nExample: Reschedule 3 2026-05-10 14:00");
-      }
-
-      await db.query(
-        "UPDATE appointments SET appointment_date = ?, appointment_time = ? WHERE appointment_id = ? AND patient_id = ?",
-        [newDate, newTime, appointmentId, patient.patient_id]
-      );
-
-      return ctx.reply("🔁 Appointment rescheduled successfully.");
-    }
-
     // ================= DEFAULT =================
-    return ctx.reply("Use the menu buttons below 👇");
+    return ctx.reply(
+      "📌 Menu:\n- My Appointments\n\n👉 Type: My Appointments"
+    );
   } catch (err) {
     console.error("BOT ERROR:", err);
-    return ctx.reply("⚠️ Server error. Please try again later.");
+    return ctx.reply("⚠️ Server error. Try again later.");
   }
 });
 
-// ================= START =================
+// ================= START BOT =================
 bot.launch();
 console.log("🤖 Bot running...");
