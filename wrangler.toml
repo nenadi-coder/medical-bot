@@ -1,0 +1,12 @@
+name = "medical-bot"
+main = "index.js"
+compatibility_date = "2025-04-15"
+
+[[kv_namespaces]]
+binding = "USER_STATES"
+id = "YOUR_KV_ID"
+
+[vars]
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+DB_HOST = "your-site.infinityfreeapp.com"
+API_SECRET = "YOUR_SECRET_KEY_HERE"
