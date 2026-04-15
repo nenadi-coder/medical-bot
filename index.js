@@ -47,7 +47,7 @@ bot.on("text", async (ctx) => {
     const patient = rows[0];
 
     await db.query(
-      "UPDATE patients SET telegram_user_id = ? WHERE patient_id = ?",
+      "UPDATE patients SET telegram_user_id = ? WHERE email = ?",
       [id, patient.patient_id]
     );
 
