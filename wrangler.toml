@@ -7,6 +7,6 @@ binding = "USER_STATES"
 id = "YOUR_KV_ID"
 
 [vars]
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8330456846:AAFJFM3cy7rbKr5diPbcYi8QaIDDIhktpVU"
 DB_HOST = "your-site.infinityfreeapp.com"
-API_SECRET = "YOUR_SECRET_KEY_HERE"
+API_SECRET = "nadia"
