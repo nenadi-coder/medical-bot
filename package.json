@@ -1,0 +1,13 @@
+{
+  "name": "medical-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "mysql2": "^3.11.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}
