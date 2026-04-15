@@ -4,7 +4,7 @@ compatibility_date = "2025-04-15"
 
 [[kv_namespaces]]
 binding = "USER_STATES"
-id = "YOUR_KV_ID"
+id = "f8a475d5ea614bc09db22077581e1fe6"
 
 [vars]
 BOT_TOKEN = "8330456846:AAFJFM3cy7rbKr5diPbcYi8QaIDDIhktpVU"
