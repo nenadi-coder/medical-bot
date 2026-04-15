@@ -1,95 +1,79 @@
 const express = require('express');
 const { Telegraf } = require('telegraf');
-const { createClient } = require('@supabase/supabase-js');
+const mysql = require('mysql2/promise');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
 
-// Supabase client
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// ========== MYSQL DATABASE CONNECTION ==========
+const dbConfig = {
+    host: process.env.DB_HOST || 'sql207.infinityfree.com',
+    user: process.env.DB_USER || 'if0_41555171',
+    password: process.env.DB_PASSWORD || 'fkwDocFNbnScb0',
+    database: process.env.DB_NAME || 'if0_41555171_medical_practice',
+    waitForConnections: true,
+    connectionLimit: 10
+};
 
-// Health check endpoint (REQUIRED for Render)
-app.get('/health', (req, res) => {
-    res.status(200).send('OK');
-});
+let pool;
 
-// Webhook endpoint for Telegram
-app.use(await bot.createWebhook({ domain: process.env.RENDER_URL }));
+async function initDB() {
+    pool = mysql.createPool(dbConfig);
+    console.log('✅ MySQL connected');
+}
 
 // ========== HELPER FUNCTIONS ==========
 
-// Get or create user state
-async function getUserState(telegramUserId) {
-    const { data, error } = await supabase
-        .from('telegram_user_states')
-        .select('*')
-        .eq('telegram_user_id', telegramUserId)
-        .maybeSingle();
-    
-    if (error || !data) {
-        // Create new state
-        const { data: newState, error: createError } = await supabase
-            .from('telegram_user_states')
-            .insert({
-                telegram_user_id: telegramUserId,
-                current_state: 'idle',
-                chat_id: telegramUserId
-            })
-            .select()
-            .single();
-        
-        if (createError) return null;
-        return newState;
+// Get or create user state (in memory for now - upgrade to DB table later)
+const userStates = new Map();
+
+function getUserState(telegramUserId) {
+    if (!userStates.has(telegramUserId)) {
+        userStates.set(telegramUserId, {
+            telegram_user_id: telegramUserId,
+            current_state: 'idle',
+            linked_patient_id: null,
+            pending_email: null
+        });
     }
-    return data;
+    return userStates.get(telegramUserId);
 }
 
-// Update user state
-async function updateUserState(telegramUserId, updates) {
-    const { data, error } = await supabase
-        .from('telegram_user_states')
-        .update(updates)
-        .eq('telegram_user_id', telegramUserId)
-        .select()
-        .single();
-    
-    if (error) return null;
-    return data;
+function updateUserState(telegramUserId, updates) {
+    const state = getUserState(telegramUserId);
+    Object.assign(state, updates);
+    userStates.set(telegramUserId, state);
+    return state;
 }
 
 // Get patient by telegram ID
 async function getPatientByTelegramId(telegramUserId) {
-    const { data, error } = await supabase
-        .from('patients')
-        .select('*')
-        .eq('telegram_id', telegramUserId)
-        .maybeSingle();
-    
-    if (error || !data) return null;
-    return data;
+    const [rows] = await pool.execute(
+        'SELECT * FROM patients WHERE telegram_id = ?',
+        [telegramUserId]
+    );
+    return rows[0] || null;
 }
 
 // Link patient to telegram
 async function linkPatient(telegramUserId, email) {
     // Find patient by email
-    const { data: patient, error: findError } = await supabase
-        .from('patients')
-        .select('*')
-        .eq('email', email.toLowerCase())
-        .maybeSingle();
+    const [patients] = await pool.execute(
+        'SELECT * FROM patients WHERE email = ?',
+        [email.toLowerCase()]
+    );
     
-    if (findError || !patient) return null;
+    if (patients.length === 0) return null;
+    const patient = patients[0];
     
     // Update patient with telegram_id
-    const { error: updateError } = await supabase
-        .from('patients')
-        .update({ telegram_id: telegramUserId })
-        .eq('patient_id', patient.patient_id);
-    
-    if (updateError) return null;
+    await pool.execute(
+        'UPDATE patients SET telegram_id = ? WHERE patient_id = ?',
+        [telegramUserId, patient.patient_id]
+    );
     
     // Update user state
-    await updateUserState(telegramUserId, {
+    updateUserState(telegramUserId, {
         current_state: 'linked',
         linked_patient_id: patient.patient_id
     });
@@ -99,44 +83,71 @@ async function linkPatient(telegramUserId, email) {
 
 // Get upcoming appointments for patient
 async function getUpcomingAppointments(patientId) {
-    const { data, error } = await supabase
-        .from('appointments')
-        .select(`
-            *,
-            doctors (first_name, last_name)
-        `)
-        .eq('patient_id', patientId)
-        .eq('status', 'scheduled')
-        .gte('appointment_date', new Date().toISOString().split('T')[0])
-        .order('appointment_date', { ascending: true })
-        .order('appointment_time', { ascending: true });
-    
-    if (error) return [];
-    return data || [];
+    const [rows] = await pool.execute(
+        `SELECT a.*, CONCAT(d.first_name, ' ', d.last_name) as doctor_name
+         FROM appointments a
+         LEFT JOIN doctors d ON a.doctor_id = d.doctor_id
+         WHERE a.patient_id = ? 
+         AND a.status = 'scheduled'
+         AND a.appointment_date >= CURDATE()
+         ORDER BY a.appointment_date ASC, a.appointment_time ASC`,
+        [patientId]
+    );
+    return rows;
 }
 
 // Get queue position for an appointment
-async function getQueuePosition(appointmentDate, appointmentTime, currentId) {
-    const { count, error } = await supabase
-        .from('appointments')
-        .select('*', { count: 'exact', head: true })
-        .eq('appointment_date', appointmentDate)
-        .eq('status', 'scheduled')
-        .lt('appointment_time', appointmentTime);
-    
-    if (error) return 1;
-    return count + 1;
+async function getQueuePosition(appointmentDate, appointmentTime) {
+    const [rows] = await pool.execute(
+        `SELECT COUNT(*) + 1 as position 
+         FROM appointments 
+         WHERE appointment_date = ? 
+         AND appointment_time < ?
+         AND status = 'scheduled'`,
+        [appointmentDate, appointmentTime]
+    );
+    return rows[0]?.position || 1;
 }
 
 // Cancel appointment
 async function cancelAppointment(appointmentId, patientId) {
-    const { error } = await supabase
-        .from('appointments')
-        .update({ status: 'cancelled' })
-        .eq('appointment_id', appointmentId)
-        .eq('patient_id', patientId);
+    const [result] = await pool.execute(
+        'UPDATE appointments SET status = ? WHERE appointment_id = ? AND patient_id = ?',
+        ['cancelled', appointmentId, patientId]
+    );
+    return result.affectedRows > 0;
+}
+
+// Send message to Telegram
+async function sendMessage(chatId, text, replyMarkup = null) {
+    try {
+        if (replyMarkup) {
+            await bot.telegram.sendMessage(chatId, text, { 
+                parse_mode: 'Markdown',
+                reply_markup: replyMarkup
+            });
+        } else {
+            await bot.telegram.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+        }
+    } catch (error) {
+        console.error('Send message error:', error);
+    }
+}
+
+// Show main menu
+async function showMainMenu(chatId, patient) {
+    const keyboard = {
+        keyboard: [
+            ['📅 My Appointments', '🎫 Queue Position'],
+            ['❌ Cancel Appointment', '📝 Reschedule Appointment'],
+            ['❓ Help']
+        ],
+        resize_keyboard: true
+    };
     
-    return !error;
+    await sendMessage(chatId, 
+        `✅ Welcome back ${patient.first_name} ${patient.last_name}!\n\nWhat would you like to do?`,
+        keyboard);
 }
 
 // ========== BOT COMMANDS ==========
@@ -144,78 +155,66 @@ async function cancelAppointment(appointmentId, patientId) {
 // Start command
 bot.start(async (ctx) => {
     const telegramUserId = ctx.from.id;
-    const userState = await getUserState(telegramUserId);
+    const chatId = ctx.chat.id;
+    
+    getUserState(telegramUserId);
     const patient = await getPatientByTelegramId(telegramUserId);
     
     if (patient) {
-        await updateUserState(telegramUserId, { current_state: 'linked', linked_patient_id: patient.patient_id });
-        await showMainMenu(ctx, patient);
+        updateUserState(telegramUserId, { current_state: 'linked', linked_patient_id: patient.patient_id });
+        await showMainMenu(chatId, patient);
     } else {
-        await updateUserState(telegramUserId, { current_state: 'awaiting_email', pending_email: null });
-        ctx.reply('👋 Welcome! Please send your email address to link your account.');
+        updateUserState(telegramUserId, { current_state: 'awaiting_email' });
+        await sendMessage(chatId, '👋 Welcome! Please send your email address to link your account.');
     }
 });
-
-// Show main menu
-async function showMainMenu(ctx, patient) {
-    const keyboard = {
-        reply_markup: {
-            keyboard: [
-                ['📅 My Appointments', '🎫 Queue Position'],
-                ['❌ Cancel Appointment', '📝 Reschedule Appointment'],
-                ['❓ Help']
-            ],
-            resize_keyboard: true
-        }
-    };
-    
-    ctx.reply(`✅ Welcome back ${patient.first_name} ${patient.last_name}!\n\nWhat would you like to do?`, keyboard);
-}
 
 // Handle text messages
 bot.on('text', async (ctx) => {
     const telegramUserId = ctx.from.id;
+    const chatId = ctx.chat.id;
     const text = ctx.message.text;
-    const userState = await getUserState(telegramUserId);
+    
+    const userState = getUserState(telegramUserId);
     const patient = await getPatientByTelegramId(telegramUserId);
     
     // If user is not linked and not awaiting email
-    if (!patient && (!userState || userState.current_state !== 'awaiting_email')) {
-        ctx.reply('❌ Account not linked. Please send your email address to link your account.');
-        await updateUserState(telegramUserId, { current_state: 'awaiting_email' });
+    if (!patient && userState.current_state !== 'awaiting_email') {
+        await sendMessage(chatId, '❌ Account not linked. Please send your email address to link your account.');
+        updateUserState(telegramUserId, { current_state: 'awaiting_email' });
         return;
     }
     
     // Awaiting email for linking
-    if (userState?.current_state === 'awaiting_email' && !patient) {
+    if (userState.current_state === 'awaiting_email' && !patient) {
         const email = text.trim().toLowerCase();
         const linkedPatient = await linkPatient(telegramUserId, email);
         
         if (linkedPatient) {
-            await showMainMenu(ctx, linkedPatient);
+            await showMainMenu(chatId, linkedPatient);
         } else {
-            ctx.reply('❌ Email not found. Please register on our website first, or try again with a different email.');
+            await sendMessage(chatId, '❌ Email not found. Please register on our website first, or try again with a different email.');
         }
         return;
     }
     
     // Awaiting appointment ID for cancellation
-    if (userState?.current_state === 'awaiting_cancel') {
+    if (userState.current_state === 'awaiting_cancel') {
         const appointmentId = parseInt(text);
         if (isNaN(appointmentId)) {
-            ctx.reply('❌ Please send a valid appointment ID number.');
+            await sendMessage(chatId, '❌ Please send a valid appointment ID number.');
             return;
         }
         
         const success = await cancelAppointment(appointmentId, patient.patient_id);
         if (success) {
-            ctx.reply('✅ Appointment cancelled successfully.');
+            await sendMessage(chatId, '✅ Appointment cancelled successfully.');
         } else {
-            ctx.reply('❌ Failed to cancel appointment. Please check the appointment ID and try again.');
+            await sendMessage(chatId, '❌ Failed to cancel appointment. Please check the appointment ID and try again.');
         }
         
-        await updateUserState(telegramUserId, { current_state: 'linked' });
-        await showMainMenu(ctx, patient);
+        updateUserState(telegramUserId, { current_state: 'linked' });
+        await showMainMenu(chatId, patient);
         return;
     }
     
@@ -225,23 +224,22 @@ bot.on('text', async (ctx) => {
             const appointments = await getUpcomingAppointments(patient.patient_id);
             
             if (appointments.length === 0) {
-                ctx.reply('📭 You have no upcoming appointments.');
+                await sendMessage(chatId, '📭 You have no upcoming appointments.');
             } else {
-                let message = '📅 *Your Upcoming Appointments:*\n\n';
+                let messageText = '📅 *Your Upcoming Appointments:*\n\n';
                 for (let i = 0; i < appointments.length; i++) {
                     const apt = appointments[i];
-                    const doctorName = apt.doctors ? `Dr. ${apt.doctors.first_name} ${apt.doctors.last_name}` : 'Doctor';
                     const date = new Date(apt.appointment_date).toLocaleDateString();
-                    const queuePos = await getQueuePosition(apt.appointment_date, apt.appointment_time, apt.appointment_id);
+                    const queuePos = await getQueuePosition(apt.appointment_date, apt.appointment_time);
                     
-                    message += `${i + 1}. 📍 *ID: ${apt.appointment_id}*\n`;
-                    message += `   📅 Date: ${date}\n`;
-                    message += `   ⏰ Time: ${apt.appointment_time}\n`;
-                    message += `   👨‍⚕️ Doctor: ${doctorName}\n`;
-                    message += `   🎫 Queue Position: #${queuePos}\n\n`;
+                    messageText += `${i + 1}. 📍 *ID: ${apt.appointment_id}*\n`;
+                    messageText += `   📅 Date: ${date}\n`;
+                    messageText += `   ⏰ Time: ${apt.appointment_time}\n`;
+                    messageText += `   👨‍⚕️ Doctor: ${apt.doctor_name}\n`;
+                    messageText += `   🎫 Queue Position: #${queuePos}\n\n`;
                 }
-                message += 'To cancel, type: ❌ Cancel Appointment';
-                ctx.reply(message, { parse_mode: 'Markdown' });
+                messageText += 'To cancel, use: ❌ Cancel Appointment';
+                await sendMessage(chatId, messageText);
             }
             break;
             
@@ -249,13 +247,14 @@ bot.on('text', async (ctx) => {
             const upcomingApps = await getUpcomingAppointments(patient.patient_id);
             
             if (upcomingApps.length === 0) {
-                ctx.reply('🎫 You have no upcoming appointments to check queue position.');
+                await sendMessage(chatId, '🎫 You have no upcoming appointments to check queue position.');
             } else {
                 const nextApp = upcomingApps[0];
-                const queuePos = await getQueuePosition(nextApp.appointment_date, nextApp.appointment_time, nextApp.appointment_id);
+                const queuePos = await getQueuePosition(nextApp.appointment_date, nextApp.appointment_time);
                 const date = new Date(nextApp.appointment_date).toLocaleDateString();
                 
-                ctx.reply(`🎫 *Your Queue Position*\n\n📅 Date: ${date}\n⏰ Time: ${nextApp.appointment_time}\n🎫 Your position: #${queuePos}\n\n👥 People ahead of you: ${queuePos - 1}`, { parse_mode: 'Markdown' });
+                await sendMessage(chatId, 
+                    `🎫 *Your Queue Position*\n\n📅 Date: ${date}\n⏰ Time: ${nextApp.appointment_time}\n🎫 Your position: #${queuePos}\n\n👥 People ahead of you: ${queuePos - 1}`);
             }
             break;
             
@@ -263,42 +262,69 @@ bot.on('text', async (ctx) => {
             const activeApps = await getUpcomingAppointments(patient.patient_id);
             
             if (activeApps.length === 0) {
-                ctx.reply('❌ You have no upcoming appointments to cancel.');
+                await sendMessage(chatId, '❌ You have no upcoming appointments to cancel.');
             } else {
-                let message = '📋 *Your appointments:*\n\n';
+                let messageText = '📋 *Your appointments:*\n\n';
                 for (const apt of activeApps) {
                     const date = new Date(apt.appointment_date).toLocaleDateString();
-                    message += `🆔 ID: ${apt.appointment_id} - ${date} at ${apt.appointment_time}\n`;
+                    messageText += `🆔 ID: ${apt.appointment_id} - ${date} at ${apt.appointment_time}\n`;
                 }
-                message += '\n✏️ Please send the **appointment ID** you want to cancel.';
-                ctx.reply(message, { parse_mode: 'Markdown' });
-                await updateUserState(telegramUserId, { current_state: 'awaiting_cancel' });
+                messageText += '\n✏️ Please send the **appointment ID** you want to cancel.';
+                await sendMessage(chatId, messageText);
+                updateUserState(telegramUserId, { current_state: 'awaiting_cancel' });
             }
             break;
             
         case '📝 Reschedule Appointment':
-            ctx.reply('📝 *Reschedule Feature*\n\nPlease contact the clinic directly at +213 XXX XX XX XX or visit our website to reschedule your appointment.\n\nAlternatively, you can cancel and book a new appointment.', { parse_mode: 'Markdown' });
+            await sendMessage(chatId, 
+                '📝 *Reschedule Feature*\n\nPlease contact the clinic directly to reschedule your appointment.\n\nAlternatively, you can cancel and book a new appointment.');
             break;
             
         case '❓ Help':
-            ctx.reply(`📖 *Help Menu*\n\n` +
+            await sendMessage(chatId,
+                `📖 *Help Menu*\n\n` +
                 `🔹 *Send email* - Link your account\n` +
                 `🔹 *📅 My Appointments* - View all upcoming appointments\n` +
                 `🔹 *🎫 Queue Position* - Check your current queue position\n` +
                 `🔹 *❌ Cancel Appointment* - Cancel an existing appointment\n` +
                 `🔹 *📝 Reschedule Appointment* - Instructions to reschedule\n` +
-                `🔹 *❓ Help* - Show this menu\n\n` +
-                `📞 For urgent issues, call the clinic: +213 XXX XX XX XX`,
-                { parse_mode: 'Markdown' });
+                `🔹 *❓ Help* - Show this menu`);
             break;
             
         default:
-            ctx.reply('❓ Unknown command. Please use the menu buttons or type /start to reset.');
+            await sendMessage(chatId, '❓ Unknown command. Please use the menu buttons or type /start to reset.');
     }
 });
 
-// Start the web server
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-    console.log(`Bot webhook listening on port ${port}`);
+// ========== EXPRESS WEBHOOK SETUP ==========
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
 });
+
+// Webhook endpoint for Telegram
+app.use(bot.webhookCallback('/webhook'));
+
+// Set webhook URL
+const RENDER_URL = process.env.RENDER_URL || 'https://your-bot.onrender.com';
+
+// Start the server
+async function start() {
+    await initDB();
+    
+    const port = process.env.PORT || 3000;
+    app.listen(port, () => {
+        console.log(`Bot webhook listening on port ${port}`);
+    });
+    
+    // Set webhook
+    try {
+        await bot.telegram.setWebhook(`${RENDER_URL}/webhook`);
+        console.log('Webhook set successfully');
+    } catch (err) {
+        console.error('Failed to set webhook:', err);
+    }
+}
+
+start().catch(console.error);
